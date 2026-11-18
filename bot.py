@@ -11,9 +11,10 @@ except ImportError:  # pragma: no cover - optional dependency
 
 try:
     from backtesting import Backtest, Strategy
-    from backtesting.lib import crossover
+    from backtesting.lib import crossover, FractionalBacktest
 except ImportError:  # pragma: no cover - optional dependency
     Backtest = None
+    FractionalBacktest = None
     Strategy = object
     crossover = None
 
@@ -91,6 +92,38 @@ def fetch_market_data(symbol="AAPL", start="2022-01-01", end="2026-01-01"):
     }, index=dates)
 
 
+def compute_atr(high, low, close, period=14):
+    """Compute Average True Range from high, low, close arrays.
+
+    Uses Wilder's smoothing (exponential moving average of true range).
+    """
+    high = np.asarray(high, dtype=float)
+    low = np.asarray(low, dtype=float)
+    close = np.asarray(close, dtype=float)
+
+    if high.size < 2:
+        return np.full_like(close, 0.0, dtype=float)
+
+    # True Range: max(H-L, |H-prevC|, |L-prevC|)
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+
+    atr = np.zeros_like(close, dtype=float)
+    if tr.size <= period:
+        atr[:] = np.mean(tr)
+        return atr
+
+    # Seed with simple average of first `period` true ranges
+    atr[period - 1] = np.mean(tr[:period])
+    for i in range(period, len(tr)):
+        atr[i] = ((atr[i - 1] * (period - 1)) + tr[i]) / period
+
+    # Backfill early values
+    atr[:period - 1] = atr[period - 1]
+    return atr
+
+
 def compute_rsi(series, period=14):
     """Compute a standard RSI from a numeric array."""
     series = np.asarray(series, dtype=float)
@@ -115,24 +148,37 @@ def compute_rsi(series, period=14):
     return np.clip(rsi, 0, 100)
 
 
-def build_signal(data, fast_sma_period=20, slow_sma_period=50, rsi_period=14, rsi_oversold=35, rsi_overbought=65):
-    """Return a BUY, SELL, or HOLD signal based on SMA crossover and RSI momentum."""
+def build_signal(data, fast_sma_period=20, slow_sma_period=50, rsi_period=14,
+                  rsi_oversold=35, rsi_overbought=65, rsi_lookback=10, atr_period=14):
+    """Return a BUY, SELL, or HOLD signal based on SMA crossover and RSI momentum.
+
+    RSI is checked over a lookback window (default 10 bars) rather than only on
+    the exact crossover bar.  This avoids the common pitfall where the crossover
+    arrives *after* RSI has already recovered from oversold/overbought territory.
+
+    ATR is computed and included in the output for risk management reference.
+    """
     rows = _as_rows(data)
     if not rows:
         raise ValueError("No market data available to generate a signal.")
 
     close = np.asarray([float(row["Close"]) for row in rows if row.get("Close") is not None], dtype=float)
+    high = np.asarray([float(row["High"]) for row in rows if row.get("High") is not None], dtype=float)
+    low = np.asarray([float(row["Low"]) for row in rows if row.get("Low") is not None], dtype=float)
+
     if close.size < max(slow_sma_period, rsi_period):
         return {
             "signal": "HOLD",
             "price": float(close[-1]) if close.size else 0.0,
             "rsi": 50.0,
+            "atr": 0.0,
             "reason": "Insufficient history for a valid signal.",
         }
 
     sma_fast = np.convolve(close, np.ones(fast_sma_period) / fast_sma_period, mode="valid")
     sma_slow = np.convolve(close, np.ones(slow_sma_period) / slow_sma_period, mode="valid")
     rsi = compute_rsi(close, period=rsi_period)
+    atr = compute_atr(high, low, close, period=atr_period)
 
     idx = -1
     prev_fast = sma_fast[-2] if sma_fast.size >= 2 else sma_fast[-1]
@@ -140,13 +186,25 @@ def build_signal(data, fast_sma_period=20, slow_sma_period=50, rsi_period=14, rs
     curr_fast = sma_fast[idx]
     curr_slow = sma_slow[idx]
     curr_rsi = rsi[idx]
+    curr_atr = atr[idx]
 
-    if prev_fast < prev_slow and curr_fast > curr_slow and curr_rsi < rsi_oversold:
+    # Check if RSI was recently oversold/overbought within the lookback window
+    rsi_window = rsi[-rsi_lookback:]
+    recently_oversold = float(np.min(rsi_window)) < rsi_oversold
+    recently_overbought = float(np.max(rsi_window)) > rsi_overbought
+
+    if prev_fast < prev_slow and curr_fast > curr_slow and recently_oversold:
         signal = "BUY"
-        reason = "Fast SMA crossed above slow SMA and RSI is below oversold threshold."
-    elif prev_fast > prev_slow and curr_fast < curr_slow and curr_rsi > rsi_overbought:
+        reason = f"Fast SMA crossed above slow SMA and RSI was below {rsi_oversold} within the last {rsi_lookback} bars."
+    elif prev_fast > prev_slow and curr_fast < curr_slow and recently_overbought:
         signal = "SELL"
-        reason = "Fast SMA crossed below slow SMA and RSI is above overbought threshold."
+        reason = f"Fast SMA crossed below slow SMA and RSI was above {rsi_overbought} within the last {rsi_lookback} bars."
+    elif curr_fast > curr_slow and curr_rsi < rsi_oversold:
+        signal = "BUY"
+        reason = "Fast SMA is above slow SMA and RSI is currently oversold."
+    elif curr_fast < curr_slow and curr_rsi > rsi_overbought:
+        signal = "SELL"
+        reason = "Fast SMA is below slow SMA and RSI is currently overbought."
     else:
         signal = "HOLD"
         reason = "Trend and momentum are not aligned with a clear trade setup."
@@ -157,6 +215,7 @@ def build_signal(data, fast_sma_period=20, slow_sma_period=50, rsi_period=14, rs
         "sma_fast": float(curr_fast),
         "sma_slow": float(curr_slow),
         "rsi": float(curr_rsi),
+        "atr": float(curr_atr),
         "reason": reason,
     }
 
@@ -197,6 +256,7 @@ def run_backtest(data, cash=10_000, commission=0.001):
         rsi_period = 14
         rsi_oversold = 35
         rsi_overbought = 65
+        rsi_lookback = 10
 
         def init(self):
             close = self.data.Close
@@ -209,30 +269,44 @@ def run_backtest(data, cash=10_000, commission=0.001):
                 self.sma_slow = self.I(lambda x: np.convolve(x, np.ones(self.slow_sma_period) / self.slow_sma_period, mode="valid"), close)
                 self.rsi = self.I(lambda x: compute_rsi(x, self.rsi_period), close)
 
+        def _recently_oversold(self):
+            window = min(self.rsi_lookback, len(self.rsi))
+            return min(self.rsi[-window:]) < self.rsi_oversold
+
+        def _recently_overbought(self):
+            window = min(self.rsi_lookback, len(self.rsi))
+            return max(self.rsi[-window:]) > self.rsi_overbought
+
         def next(self):
             if len(self.data) < max(self.slow_sma_period, self.rsi_period):
                 return
             if not self.position:
-                if crossover(self.sma_fast, self.sma_slow) and self.rsi[-1] < self.rsi_oversold:
+                # BUY on crossover with recent oversold, or trend-aligned oversold
+                buy_crossover = crossover(self.sma_fast, self.sma_slow) and self._recently_oversold()
+                buy_momentum = self.sma_fast[-1] > self.sma_slow[-1] and self.rsi[-1] < self.rsi_oversold
+                if buy_crossover or buy_momentum:
                     entry_price = self.data.Close[-1]
-                    self.buy(sl=entry_price * 0.98, tp=entry_price * 1.05)
-            elif crossover(self.sma_slow, self.sma_fast) or self.rsi[-1] > self.rsi_overbought:
-                self.position.close()
+                    self.buy(sl=entry_price * 0.95, tp=entry_price * 1.10)
+            else:
+                # SELL on bearish crossover with recent overbought, or RSI overbought
+                if crossover(self.sma_slow, self.sma_fast) or self.rsi[-1] > self.rsi_overbought:
+                    self.position.close()
 
-    bt = Backtest(data, _Strategy, cash=cash, commission=commission, exclusive_orders=True)
+    bt_class = FractionalBacktest if FractionalBacktest is not None else Backtest
+    bt = bt_class(data, _Strategy, cash=cash, commission=commission, exclusive_orders=True)
     return bt.run()
 
 
 def main():
-    print("Fetching market data...")
-    data = fetch_market_data()
+    print("Fetching crypto market data...")
+    data = fetch_market_data(symbol="BTC-USD", start="2022-01-01", end="2026-01-01")
     print(f"Loaded {len(data)} candles for the current session.")
 
     signal = build_signal(data)
     print(f"Current signal: {signal['signal']} | price: ${signal['price']:.2f} | RSI: {signal['rsi']:.2f}")
     print(f"Reason: {signal['reason']}")
 
-    stats = run_backtest(data)
+    stats = run_backtest(data, cash=100_000)
     print("\n" + "=" * 40)
     print("BACKTEST PERFORMANCE SUMMARY")
     print("=" * 40)
